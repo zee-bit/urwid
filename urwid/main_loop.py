@@ -128,6 +128,8 @@ class MainLoop(object):
         self.event_loop = event_loop
 
         self._watch_pipes = {}
+        self._alarms = []
+        self._watch_files = {}
 
     def _set_widget(self, widget):
         self._widget = widget
@@ -583,8 +585,6 @@ class SelectEventLoop(object):
     def __init__(self):
         self._alarms = []
         self._watch_files = {}
-        self._idle_handle = 0
-        self._idle_callbacks = {}
 
     def alarm(self, seconds, callback):
         """
@@ -637,42 +637,12 @@ class SelectEventLoop(object):
             return True
         return False
 
-    def enter_idle(self, callback):
-        """
-        Add a callback for entering idle.
-
-        Returns a handle that may be passed to remove_idle()
-        """
-        self._idle_handle += 1
-        self._idle_callbacks[self._idle_handle] = callback
-        return self._idle_handle
-
-    def remove_enter_idle(self, handle):
-        """
-        Remove an idle callback.
-
-        Returns True if the handle was removed.
-        """
-        try:
-            del self._idle_callbacks[handle]
-        except KeyError:
-            return False
-        return True
-
-    def _entering_idle(self):
-        """
-        Call all the registered idle callbacks.
-        """
-        for callback in self._idle_callbacks.values():
-            callback()
-
     def run(self):
         """
         Start the event loop.  Exit the loop when any callback raises
         an exception.  If ExitMainLoop is raised, exit cleanly.
         """
         try:
-            self._did_something = True
             while True:
                 try:
                     self._loop()
@@ -688,32 +658,21 @@ class SelectEventLoop(object):
         A single iteration of the event loop
         """
         fds = self._watch_files.keys()
-        if self._alarms or self._did_something:
-            if self._alarms:
-                tm = self._alarms[0][0]
-                timeout = max(0, tm - time.time())
-            if self._did_something and (not self._alarms or
-                    (self._alarms and timeout > 0)):
-                timeout = 0
-                tm = 'idle'
+        if self._alarms:
+            tm = self._alarms[0][0]
+            timeout = max(0, tm - time.time())
             ready, w, err = select.select(fds, [], fds, timeout)
         else:
             tm = None
             ready, w, err = select.select(fds, [], fds)
 
-        if not ready:
-            if tm == 'idle':
-                self._entering_idle()
-                self._did_something = False
-            elif tm is not None:
-                # must have been a timeout
-                tm, alarm_callback = self._alarms.pop(0)
-                alarm_callback()
-                self._did_something = True
+        if not ready and tm is not None:
+            # must have been a timeout
+            tm, alarm_callback = self._alarms.pop(0)
+            alarm_callback()
 
         for fd in ready:
             self._watch_files[fd]()
-            self._did_something = True
 
 
 class GLibEventLoop(object):
@@ -726,12 +685,8 @@ class GLibEventLoop(object):
         self.GLib = GLib
         self._alarms = []
         self._watch_files = {}
-        self._idle_handle = 0
-        self._glib_idle_enabled = False # have we called glib.idle_add?
-        self._idle_callbacks = {}
         self._loop = GLib.MainLoop()
         self._exc_info = None
-        self._enable_glib_idle()
 
     def alarm(self, seconds, callback):
         """
@@ -746,7 +701,6 @@ class GLibEventLoop(object):
         @self.handle_exit
         def ret_false():
             callback()
-            self._enable_glib_idle()
             return False
         fd = self.GLib.timeout_add(int(seconds*1000), ret_false)
         self._alarms.append(fd)
@@ -778,7 +732,6 @@ class GLibEventLoop(object):
         @self.handle_exit
         def io_callback(source, cb_condition):
             callback()
-            self._enable_glib_idle()
             return True
         self._watch_files[fd] = \
              self.GLib.io_add_watch(fd,self.GLib.IO_IN,io_callback)
@@ -795,40 +748,6 @@ class GLibEventLoop(object):
             del self._watch_files[handle]
             return True
         return False
-
-    def enter_idle(self, callback):
-        """
-        Add a callback for entering idle.
-
-        Returns a handle that may be passed to remove_enter_idle()
-        """
-        self._idle_handle += 1
-        self._idle_callbacks[self._idle_handle] = callback
-        return self._idle_handle
-
-    def _enable_glib_idle(self):
-        if self._glib_idle_enabled:
-            return
-        self.GLib.idle_add(self._glib_idle_callback)
-        self._glib_idle_enabled = True
-
-    def _glib_idle_callback(self):
-        for callback in self._idle_callbacks.values():
-            callback()
-        self._glib_idle_enabled = False
-        return False # ask glib not to call again (or we would be called
-
-    def remove_enter_idle(self, handle):
-        """
-        Remove an idle callback.
-
-        Returns True if the handle was removed.
-        """
-        try:
-            del self._idle_callbacks[handle]
-        except KeyError:
-            return False
-        return True
 
     def run(self):
         """
@@ -873,69 +792,12 @@ class TornadoEventLoop(object):
     """ This is an Urwid-specific event loop to plug into its MainLoop.
         It acts as an adaptor for Tornado's IOLoop which does all
         heavy lifting except idle-callbacks.
-
-        Notice, since Tornado has no concept of idle callbacks we
-        monkey patch ioloop._impl.poll() function to be able to detect
-        potential idle periods.
     """
-    _ioloop_registry = WeakKeyDictionary()  # {<ioloop> : {<handle> : <idle_func>}}
-    _max_idle_handle = 0
-
-    class PollProxy(object):
-        """ A simple proxy for a Python's poll object that wraps the .poll() method
-            in order to detect idle periods and call Urwid callbacks
-        """
-        def __init__(self, poll_obj, idle_map):
-            self.__poll_obj = poll_obj
-            self.__idle_map = idle_map
-            self._idle_done = False
-            self._prev_timeout = 0
-
-        def __getattr__(self, name):
-            return getattr(self.__poll_obj, name)
-
-        def poll(self, timeout):
-            if timeout > self._prev_timeout:
-                # if timeout increased we assume a timer event was handled
-                self._idle_done = False
-            self._prev_timeout = timeout
-            start = time.time()
-
-            # any IO pending wins
-            events = self.__poll_obj.poll(0)
-            if events:
-                self._idle_done = False
-                return events
-
-            # our chance to enter idle
-            if not self._idle_done:
-                for callback in self.__idle_map.values():
-                    callback()
-                self._idle_done = True
-
-            # then complete the actual request (adjusting timeout)
-            timeout = max(0, min(timeout, timeout + start - time.time()))
-            events = self.__poll_obj.poll(timeout)
-            if events:
-                self._idle_done = False
-            return events
-
-    @classmethod
-    def _patch_poll_impl(cls, ioloop):
-        """ Wraps original poll object in the IOLoop's poll object
-        """
-        if ioloop in cls._ioloop_registry:
-            return  # we already patched this instance
-
-        cls._ioloop_registry[ioloop] = idle_map = {}
-        ioloop._impl = cls.PollProxy(ioloop._impl, idle_map)
-
     def __init__(self, ioloop=None):
         if not ioloop:
             from tornado.ioloop import IOLoop
             ioloop = IOLoop.instance()
         self._ioloop = ioloop
-        self._patch_poll_impl(ioloop)
         self._pending_alarms = {}
         self._watch_handles    = {}  # {<watch_handle> : <file_descriptor>}
         self._max_watch_handle = 0
@@ -979,18 +841,6 @@ class TornadoEventLoop(object):
             self._ioloop.remove_handler(fd)
             return True
 
-    def enter_idle(self, callback):
-        self._max_idle_handle += 1
-        handle   = self._max_idle_handle
-        idle_map = self._ioloop_registry[self._ioloop]
-        idle_map[handle] = callback
-        return handle
-
-    def remove_enter_idle(self, handle):
-        idle_map = self._ioloop_registry[self._ioloop]
-        cb = idle_map.pop(handle, None)
-        return cb is not None
-
     def handle_exit(self, func):
         @wraps(func)
         def wrapper(*args, **kw):
@@ -1033,8 +883,6 @@ class TwistedEventLoop(object):
     """
     Event loop based on Twisted_
     """
-    _idle_emulation_delay = 1.0/256 # a short time (in seconds)
-
     def __init__(self, reactor=None, manage_reactor=True):
         """
         :param reactor: reactor to use
@@ -1061,12 +909,8 @@ class TwistedEventLoop(object):
         self.reactor = reactor
         self._alarms = []
         self._watch_files = {}
-        self._idle_handle = 0
-        self._twisted_idle_enabled = False
-        self._idle_callbacks = {}
         self._exc_info = None
         self.manage_reactor = manage_reactor
-        self._enable_twisted_idle()
 
     def alarm(self, seconds, callback):
         """
@@ -1124,49 +968,6 @@ class TwistedEventLoop(object):
             return True
         return False
 
-    def enter_idle(self, callback):
-        """
-        Add a callback for entering idle.
-
-        Returns a handle that may be passed to remove_enter_idle()
-        """
-        self._idle_handle += 1
-        self._idle_callbacks[self._idle_handle] = callback
-        return self._idle_handle
-
-    def _enable_twisted_idle(self):
-        """
-        Twisted's reactors don't have an idle or enter-idle callback
-        so the best we can do for now is to set a timer event in a very
-        short time to approximate an enter-idle callback.
-
-        .. WARNING::
-           This will perform worse than the other event loops until we can find a
-           fix or workaround
-        """
-        if self._twisted_idle_enabled:
-            return
-        self.reactor.callLater(self._idle_emulation_delay,
-            self.handle_exit(self._twisted_idle_callback, enable_idle=False))
-        self._twisted_idle_enabled = True
-
-    def _twisted_idle_callback(self):
-        for callback in self._idle_callbacks.values():
-            callback()
-        self._twisted_idle_enabled = False
-
-    def remove_enter_idle(self, handle):
-        """
-        Remove an idle callback.
-
-        Returns True if the handle was removed.
-        """
-        try:
-            del self._idle_callbacks[handle]
-        except KeyError:
-            return False
-        return True
-
     def run(self):
         """
         Start the event loop.  Exit the loop when any callback raises
@@ -1181,7 +982,7 @@ class TwistedEventLoop(object):
             self._exc_info = None
             raise exc_info[0], exc_info[1], exc_info[2]
 
-    def handle_exit(self, f, enable_idle=True):
+    def handle_exit(self, f):
         """
         Decorator that cleanly exits the :class:`TwistedEventLoop` if
         :class:`ExitMainLoop` is thrown inside of the wrapped function. Store the
@@ -1203,8 +1004,6 @@ class TwistedEventLoop(object):
                 self._exc_info = sys.exc_info()
                 if self.manage_reactor:
                     self.reactor.crash()
-            if enable_idle:
-                self._enable_twisted_idle()
             return rval
         return wrapper
 
@@ -1218,8 +1017,6 @@ class AsyncioEventLoop(object):
     slightly different syntax, but also works with this loop.
     """
     _we_started_event_loop = False
-
-    _idle_emulation_delay = 1.0/256  # a short time (in seconds)
 
     def __init__(self, **kwargs):
         if 'loop' in kwargs:
@@ -1270,35 +1067,6 @@ class AsyncioEventLoop(object):
         Returns True if the input file exists, False otherwise
         """
         return self._loop.remove_reader(handle)
-
-    def enter_idle(self, callback):
-        """
-        Add a callback for entering idle.
-
-        Returns a handle that may be passed to remove_idle()
-        """
-        # XXX there's no such thing as "idle" in most event loops; this fakes
-        # it the same way as Twisted, by scheduling the callback to be called
-        # repeatedly
-        mutable_handle = [None]
-        def faux_idle_callback():
-            callback()
-            mutable_handle[0] = self._loop.call_later(
-                self._idle_emulation_delay, faux_idle_callback)
-
-        mutable_handle[0] = self._loop.call_later(
-            self._idle_emulation_delay, faux_idle_callback)
-
-        return mutable_handle
-
-    def remove_enter_idle(self, handle):
-        """
-        Remove an idle callback.
-
-        Returns True if the handle was removed.
-        """
-        # `handle` is just a list containing the current actual handle
-        return self.remove_alarm(handle[0])
 
     _exc_info = None
 

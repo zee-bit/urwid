@@ -21,6 +21,9 @@ while read -r line; do
 	# the echo trick is needed to expand RXVTWINDOWID variable
 	echo $line | xdotool -
 	echo "sending $line"
+	# we don't want the screenshot to race against the terminal
+	# 50 ms is plenty to pump through and handle the sent events
+	sleep 0.05
 	import -window "$RXVTWINDOWID" "${image}$c.png"
 	(( c++ ))
 done
